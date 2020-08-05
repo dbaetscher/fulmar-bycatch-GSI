@@ -1,0 +1,100 @@
+---
+title: "04-tidy-bycatch-data"
+output: html_notebook
+---
+
+Step 1 for bycatch data
+
+Here, we will take a first stab at filtering the haplotype data from the bycatch birds and then assigning those samples to our colony baseline using rubias.
+
+To start off with, let's load data and libs:
+```{r load-stuff}
+library(tidyverse)
+library(CKMRsim)
+library(stringr)
+
+meta <- readRDS("bycatch_data/meta-data-tibble.rds")
+genos <- readRDS("bycatch_data/april_called_genos_na_explicit.rds") %>%
+  filter(NMFS_DNA_ID %in% meta$NMFS_DNA_ID)  # drop those we don't have meta data for
+samples <- readRDS("bycatch_data/sample-sheet-tibble.rds") %>%
+  filter(NMFS_DNA_ID %in% meta$NMFS_DNA_ID)
+
+# loci that deviate from HWE in the baseline populations
+outliers <- read_csv("csv_outputs/loci_out_hwe.csv")
+
+```
+
+
+## Some initial filters
+
+### Take highest read-depth call for multiply-genotyped DNA_IDs
+
+There shouldn't be any of these. But just to make sure...
+Now, here is a harder operation: if an individual is multiply-genotyped, take the
+genotype with the highest total read depth. 
+```{r take-just-one}
+# slow-ish function to get the total read depth column
+tdepth <- function(a, d) {
+  if(any(is.na(a))) {
+    return(NA)
+  }
+  if(a[1]==a[2]) {
+    return(d[1])
+  } else {
+    return(d[1] + d[2])
+  }
+
+}
+# this takes the highest read-depth instance of each duplicately-genotyped individual.
+geno_one_each <- genos %>%
+  group_by(NMFS_DNA_ID, locus, gtseq_run, id) %>%
+  mutate(total_depth = tdepth(allele, depth)) %>%
+  ungroup() %>%
+  arrange(NMFS_DNA_ID, locus, total_depth, gtseq_run, id, depth) %>%
+  group_by(NMFS_DNA_ID, locus) %>%
+  mutate(rank = 1:n()) %>%
+  ungroup() %>%
+  filter(rank <= 2)
+
+```
+
+Before tossing individuals with too much missing data, we want to implement our total read depth threshold.
+```{r filter-low-depth}
+# if total depth >= 20, print the allele; if not, print NA
+geno_one_each2 <- geno_one_each %>%
+   mutate(allele = ifelse(total_depth >=20, allele, NA))
+
+```
+
+
+### Toss out indivs with more than 28 missing loci
+
+```{r toss-missers}
+no_hi_missers <- geno_one_each2 %>% 
+  group_by(NMFS_DNA_ID) %>%
+  filter(sum(!is.na(allele)) >= (113*2))
+
+```
+
+## Remove the loci that significantly deviate from HWE in the baseline samples
+
+I'll remove all 8 loci
+```{r}
+outliers$Locus <- gsub("_1", "", outliers$Locus)
+```
+
+```{r}
+# replace the weird characters in the locus name to match
+no_hi_missers$locus <- gsub(":", "_", no_hi_missers$locus)
+no_hi_missers$locus <- gsub("-", "_", no_hi_missers$locus)
+```
+
+```{r}
+# now anti-join the loci to remove and the no_hi_misser genotypes
+no_hi_missers_loc <- no_hi_missers %>% 
+  anti_join(., outliers, by = c("locus" = "Locus"))
+
+# save that output
+no_hi_missers_loc %>%
+  write_csv("csv_outputs/bycatch_no_hi_missers_hwe.csv")
+```

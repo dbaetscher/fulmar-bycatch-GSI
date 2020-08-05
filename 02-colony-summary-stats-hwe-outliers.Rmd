@@ -1,0 +1,203 @@
+---
+title: "colony summary statistics and HWE calculations"
+output: html_notebook
+---
+
+## Generate summary statistics for the colony genotypes
+
+Here I'll calculate summary statistics for the microhaplotype markers for the breeding colony samples, including HWE and F-statistics.
+
+Calculate gene frequencies - need to do all of these calculations separately for the individual populations.
+
+exp_heterozygosity = 2 * Freq * (1 - Freq))
+1 - sum(p2 + q2)
+
+Fis = exp_heterozygosity - observed_heterozygosity / expected heterozygosity
+
+
+```{r load-data-and-libs}
+library(tidyverse)
+library(CKMRsim)
+library(hierfstat)
+
+# genotypes
+no_hi_missers_clean <- read_csv("csv_outputs/baseline_no_hi_missers_clean.csv")
+
+# read in population information
+pops <- read_csv("data/nofu_ids_04022019.csv")
+
+```
+
+Separate the populations
+```{r}
+subpop_genos <- no_hi_missers_clean %>%
+  left_join(., pops)
+```
+
+
+## Allele frequencies
+
+```{r kelp-genos}
+# we will use this some more
+kg2 <- subpop_genos %>% 
+  select(NMFS_DNA_ID, locus, allele, group) %>%
+  mutate(Chrom = "GTseq") %>% 
+  mutate(Pos = as.integer(factor(locus, levels = unique(locus)))) %>%
+  rename(Locus = locus,
+         Allele = allele) %>%
+  select(NMFS_DNA_ID, Chrom, Locus, Pos, Allele, group) %>%
+  ungroup()
+
+# get the allele freqs
+kg_ckmr_markers <- kg2 %>%
+  filter(!is.na(Allele)) %>% # it is vital to filter out the NAs at this stage
+  group_by(Chrom, Locus, Pos, Allele) %>%
+  summarise(counts = n()) %>%
+  group_by(Locus, Pos) %>%
+  mutate(Freq = counts / sum(counts)) %>%
+  select(-counts) %>%
+  mutate(AlleIdx = 1,
+         LocIdx = 1) %>%
+  reindex_markers(.)
+```
+
+Turn alleles into integers, spread them and then get them into the right format to run rubias.
+```{r spread-genos}
+# first make integers of the alleles
+alle_idxs <- subpop_genos %>% 
+  select(NMFS_DNA_ID, locus, gene_copy, allele, group) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(group, NMFS_DNA_ID, locus, alleidx) %>%
+  select(group, NMFS_DNA_ID, locus, gene_copy, alleidx) %>%
+  mutate(alleidx = ifelse(is.na(alleidx), 0, alleidx)) # do not do this for rubias - leave as NA's
+
+```
+
+
+## F stats
+
+```{r fstats-in-hierfstat}
+# reformat
+# first the first symbol
+alle_idxs$locus <- gsub(":", "_", alle_idxs$locus)
+
+# and the second
+alle_idxs$locus <- gsub("-", "_", alle_idxs$locus)
+
+# spread the genotypes
+two_col <- alle_idxs %>%
+  unite(loc, locus, gene_copy, sep = "_") %>%
+  spread(loc, alleidx)
+
+# convert that to an object "loci"
+data_loci <- alleles2loci(two_col, ploidy = 2, rownames = 2, population = 1)
+
+# convert that into a genind object
+data_gen <- loci2genind(data_loci, ploidy = 2, na.alleles = 0)
+
+```
+
+Now, using hierfstat for the F-statistcs
+```{r}
+test_h <- basic.stats(data_gen, diploid = TRUE)
+
+# FIS per population
+pop_fis <- test_h$Fis %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(locus = rowname)
+
+# observed heterozygosity
+pop_Ho <- test_h$Ho %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(locus = rowname)
+
+# expected heterozygosity
+pop_Hs <- test_h$Hs %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(locus = rowname)
+
+```
+
+
+
+## HWE
+
+HWE using the genind object
+```{r}
+# overall
+hw_gen <- pegas::hw.test(data_gen)
+```
+
+
+By population
+(Super helpful tutorial on these things here: https://grunwaldlab.github.io/Population_Genetics_in_R/Locus_Stats.html)
+```{r}
+# separately, by population
+data.pop <- seppop(data_gen) %>% lapply(hw.test, B = 0) # by setting B = 0, we're just looking at the analytical pvalue
+
+data.mat <- sapply(data.pop, "[", i = TRUE, j = 3) # Take the third column with all rows
+
+# filtering and identifying loci out of HWE in multiple colonies
+loci_out_of_hw <- data.mat %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(Locus = rowname) %>%
+  pivot_longer(names_to = "Colony", 2:5) %>%
+  rename(pval = value) %>%
+  filter(pval < 0.05) %>%
+  group_by(Locus) %>%
+  tally() %>%
+  arrange(desc(n))
+```
+Three loci out of HWE in all four colonies and five loci out of HWE in three of 4. 
+I'll remove all 8 loci.
+
+Create a list of those loci to remove before the self-assignment.
+```{r}
+loci_out_of_hw %>%
+  filter(n > 2) %>%
+  write_csv("csv_outputs/loci_out_hwe.csv")
+```
+
+I also should probably have a list of the HWE pval for each colony.
+```{r}
+data.mat %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(Locus = rowname) %>%
+  write_csv("csv_outputs/locus_pop_hwe_pval.csv")
+```
+
+And then make a dataframe with the per-colony heterozygosities and FIS:
+```{r}
+Hs <- pop_Hs %>%
+  rename(Chag_Hs = Chagulak) %>%
+  rename(Prib_Hs = Pribilof) %>%
+  rename(Semi_Hs = Semidi) %>%
+  rename(StMa_Hs = StMatthew)
+
+Fis <- pop_fis %>%
+  rename(Chag_Fis = Chagulak) %>%
+  rename(Prib_Fis = Pribilof) %>%
+  rename(Semi_Fis = Semidi) %>%
+  rename(StMa_Fis = StMatthew)
+  
+pop_Ho %>%
+  rename(Chag_Ho = Chagulak) %>%
+  rename(Prib_Ho = Pribilof) %>%
+  rename(Semi_Ho = Semidi) %>%
+  rename(StMa_Ho = StMatthew) %>%
+  left_join(., Hs) %>%
+  left_join(., Fis) %>%
+  select(locus, Chag_Ho, Chag_Hs, Chag_Fis, Prib_Ho, Prib_Hs, Prib_Fis, Semi_Ho, Semi_Hs, Semi_Fis, StMa_Ho, StMa_Hs, StMa_Fis) %>%
+  write_csv("csv_outputs/colony_summary_stats.csv")
+
+```
+
+
+

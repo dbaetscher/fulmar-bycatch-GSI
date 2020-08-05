@@ -1,0 +1,332 @@
+---
+title: "colony-self-assignment"
+output: html_notebook
+---
+
+After looking at summary statistics for the individual locus/populations, there were 8 loci that deviated from HWE in 3 or more pops.
+
+Try removing them and see what happens.
+
+Load libraries and data
+```{r load-data-and-libs}
+library(stringi)
+library(rubias)
+library(tidyverse)
+library(CKMRsim)
+
+
+# read in genotype data from `01-aggregate-genos-and-gsi-to..`
+no_hi_missers_clean <- read_csv("csv_outputs/baseline_no_hi_missers_clean.csv")
+
+# meta data
+meta <- readRDS("data/meta-data-tibble.rds")
+
+# loci that deviate
+outliers <- read_csv("csv_outputs/loci_out_hwe.csv")
+
+# nofu ids for samples without duplicates, etc.
+nofu_ids <- read_csv("data/nofu_ids_04022019.csv")
+```
+
+
+## Allele frequencies
+With those we can just filter down the genos to the ones that we want, and then we
+can get it into the format required for CKMR.
+```{r kelp-genos}
+# we will use this some more
+kg2 <- no_hi_missers_clean %>% 
+  select(NMFS_DNA_ID, locus, allele) %>%
+  mutate(Chrom = "GTseq") %>% 
+  mutate(Pos = as.integer(factor(locus, levels = unique(locus)))) %>%
+  rename(Locus = locus,
+         Allele = allele) %>%
+  select(NMFS_DNA_ID, Chrom, Locus, Pos, Allele) %>%
+  ungroup()
+
+# get the allele freqs
+kg_ckmr_markers <- kg2 %>%
+  filter(!is.na(Allele)) %>% # it is vital to filter out the NAs at this stage
+  group_by(Chrom, Locus, Pos, Allele) %>%
+  summarise(counts = n()) %>%
+  group_by(Locus, Pos) %>%
+  mutate(Freq = counts / sum(counts)) %>%
+  select(-counts) %>%
+  mutate(AlleIdx = 1,
+         LocIdx = 1) %>%
+  reindex_markers(.)
+
+# summary stats
+kg_ckmr_markers %>%
+  group_by(Locus) %>%
+  tally() %>%
+  arrange(n) %>%
+  summarise(mean(n))
+
+```
+
+
+Remove the 8 loci that are out of HWE in three or more of the four populations. 
+```{r}
+outliers$Locus <- gsub("_1", "", outliers$Locus)
+```
+
+```{r}
+# replace the weird characters in the locus name to match
+no_hi_missers_clean$locus <- gsub(":", "_", no_hi_missers_clean$locus)
+no_hi_missers_clean$locus <- gsub("-", "_", no_hi_missers_clean$locus)
+```
+
+```{r}
+# now anti-join the loci to remove and the no_hi_misser genotypes
+no_hi_missers_loc <- no_hi_missers_clean %>% 
+  anti_join(., outliers, by = c("locus" = "Locus"))
+
+```
+
+Check the number of samples
+```{r}
+no_hi_missers_loc %>% 
+  select(NMFS_DNA_ID) %>%
+  unique() %>%
+  left_join(nofu_ids) %>%
+  group_by(group) %>%
+  count()
+
+```
+
+Save the baseline file for use in the bycatch assignment:
+```{r}
+no_hi_missers_loc %>%
+  write_csv("csv_outputs/baseline_no_hi_missers_clean_hwe.csv")
+```
+
+
+## Self-assignment format
+
+```{r spread-genos}
+# first make integers of the alleles
+alle_idxs <- no_hi_missers_loc %>% 
+  dplyr::select(NMFS_DNA_ID, locus, gene_copy, allele) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(NMFS_DNA_ID, locus, alleidx) 
+# select just the columns to retain and spread the alleles
+alle_idx2 <- alle_idxs[,-4]
+  
+two_col <- alle_idx2 %>%
+  unite(loc, locus, gene_copy, sep = ".") %>%
+  spread(loc, alleidx)
+```
+
+### get it into the right format for rubias
+
+```{r add-meta}
+two_col2 <- two_col %>%
+  left_join(nofu_ids) # add group identity
+
+# reorder the columns
+two_col3 <- two_col2[,c(268,1:267)]
+
+# make the reference file
+rubias_genos <- two_col3 %>%
+  mutate(sample_type = "reference") %>%
+  mutate(repunit = group) %>%
+  mutate(collection = group)
+
+# reorder the columns
+rubias_genos1 <- rubias_genos[,c(269:271,1:268)]
+
+# drop the "group" column
+rubias_genos2 <- rubias_genos1[,-4]
+
+# rename indiv column
+colnames(rubias_genos2)[4] <- "indiv"
+
+rubias_genos2
+```
+
+
+```{r self-assign}
+# Now that the data are in the correct format,
+# perform self-assignment on baseline colony samples
+sa_fulmars <- self_assign(reference = rubias_genos2, gen_start_col = 5)
+
+# summarize repunit results
+sa_to_repu <- sa_fulmars %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments without a likelihood threshold
+assign_no_thres <- sa_to_repu %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally()
+
+```
+
+Summarize assignments with a 50% likelihood threshold 
+```{r}
+# 50% likelihood threshold
+thres50 <- sa_fulmars %>%
+  group_by(indiv, collection, repunit) %>%
+  filter(scaled_likelihood > 0.5) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  rename(threshold_50 = n)
+
+```
+
+Summarize assignments with a 90% likelihood threshold 
+```{r}
+# 90% likelihood threshold
+thres90 <- sa_fulmars %>%
+  group_by(indiv, collection, repunit) %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  rename(threshold_90 = n)
+
+```
+
+Combine those
+```{r}
+assign_no_thres %>%
+  left_join(., thres50) %>%
+  left_join(., thres90)
+```
+
+
+### Remove ascertainment samples from the assignment
+
+I need to remove the samples that I used for RAD-seq from my self-assignment because they were part of the ascertainment panel for the  markers.
+
+I remove them after doing the self-assignment.
+```{r remove-RAD-samples}
+# read in list of RAD samples
+rads <- read_csv("data/RAD-67-samples.csv")
+
+ids_to_remove <- rads %>%
+  left_join(., meta, by = c("Individual" = "SAMPLE_ID")) %>%
+  as_tibble() %>%
+  dplyr::select(NMFS_DNA_ID)
+# That is the list of NMFS_IDs to remove.
+```
+
+```{r remove-ids-from-rubias}
+# get the self-assignment results
+sa_fulmars2 <- sa_fulmars %>%
+  anti_join(., ids_to_remove, by = c("indiv" = "NMFS_DNA_ID"))
+# That leaves me with all the samples that were not used in ascertainment
+```
+
+Now look at the assignments without the ascertainment samples
+```{r}
+# summarize repunit results
+sa_to_repu2 <- sa_fulmars2 %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments with a likelihood threshold of 0.9
+sa_to_repu2 %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(repunit) %>%
+  mutate(total = sum(n)) %>%
+  mutate(correct = ifelse(repunit == inferred_repunit, n/total, 0)) %>%
+  ungroup() %>%
+  filter(repunit == inferred_repunit) 
+```
+Summary:
+overall - 76.7% accurately assigned
+at the 90% threshold - 91.4% samples correctly assigned
+
+
+
+## What about equalizing the number of samples?
+
+Go back to the rubias input
+
+```{r}
+#set.seed(765)
+rubias_genos_36 <- rubias_genos2 %>%
+  group_by(collection) %>%
+  sample_n(36, replace = FALSE) %>% 
+  ungroup() # Chagulak has 36 samples - so make that the equalizer
+```
+
+Now go ahead with self-assignment using that dataset
+```{r}
+# perform self-assignment on reduced number of colony samples
+assign36 <- self_assign(reference = rubias_genos_36, gen_start_col = 5)
+```
+
+
+Remove ascertainment samples
+```{r}
+# get the self-assignment results
+sa_36_no_ascert <- assign36 %>%
+  anti_join(., ids_to_remove, by = c("indiv" = "NMFS_DNA_ID"))
+```
+
+
+```{r}
+# summarize repunit results
+top_assign36 <- sa_36_no_ascert %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments without a likelihood threshold
+assign36_no_thres <- top_assign36 %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally()
+```
+
+Summarize assignments with a 50% likelihood threshold 
+```{r}
+# 50% likelihood threshold
+thres50_36samples <- top_assign36 %>%
+  group_by(indiv, collection, repunit) %>%
+  filter(scaled_likelihood > 0.5) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  rename(threshold_50 = n)
+
+```
+
+Summarize assignments with a 90% likelihood threshold 
+```{r}
+# 90% likelihood threshold
+thres90_36samples <- top_assign36 %>%
+  group_by(indiv, collection, repunit) %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  rename(threshold_90 = n)
+
+```
+
+Combine those
+```{r}
+assign36_no_thres %>%
+  left_join(., thres50_36samples) %>%
+  left_join(., thres90_36samples)
+
+
+# summary of assignments without a likelihood threshold
+top_assign36 %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(repunit) %>%
+  mutate(total = sum(n)) %>%
+  mutate(correct = ifelse(repunit == inferred_repunit, n/total, 0)) %>%
+  ungroup() %>%
+  filter(repunit == inferred_repunit) 
+```
+
+Basically, the question is whether the assignment accuracy improves for Chagulak and St. Matthew when the subsample of 36 samples is used for self-assignment.
+
+And the answer is that at the 90% likelihood threshold, the full data set rather than the downsampled data set actually performs (slightly) better, and considerably better for the Pribs and Semidis.

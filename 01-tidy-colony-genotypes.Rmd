@@ -1,0 +1,279 @@
+---
+title: "01-tidy-colony-genotypes"
+output: html_notebook
+---
+
+Beginning with genotypes for the colony samples, we want to ready those data for self-assignment using rubias.
+
+This workflow uses some functions from the CKMRsim package, which is available from https://github.com/eriqande/CKMRsim
+
+
+
+Load data and libraries
+```{r load-data-and-libs}
+library(tidyverse)
+library(CKMRsim)
+library(stringr)
+
+meta <- readRDS("data/meta-data-tibble.rds")
+genos <- readRDS("data/april_called_genos_na_explicit.rds") %>%
+  filter(NMFS_DNA_ID %in% meta$NMFS_DNA_ID)  # drop those we don't have meta data for
+samples <- readRDS("data/sample-sheet-tibble.rds") %>%
+  filter(NMFS_DNA_ID %in% meta$NMFS_DNA_ID)
+```
+
+
+
+## Some initial filters
+
+```{r get-fulmars}
+keepers <- meta %>%
+  dplyr::select(NMFS_DNA_ID) %>%
+  unlist() %>% unname()
+  
+```
+
+Whittle the genotype data down to those from the meta data:
+```{r whittle-genos}
+kgenos <- genos %>%
+  filter(NMFS_DNA_ID %in% keepers)
+
+```
+611 samples
+
+## Check regenotyped samples for consistency
+
+There should be some of these from my re-genotyping effort with Chagulak.
+```{r}
+# regeno <- kgenos %>%
+#   select(NMFS_DNA_ID) %>%
+#   group_by(NMFS_DNA_ID) %>%
+#   tally() %>%
+#   arrange(desc(n)) %>%
+#   filter(n > 500) %>% # these are the 61 that I re-genotyped.
+#   select(NMFS_DNA_ID)
+```
+
+
+### Take highest read-depth call for multiply-genotyped DNA_IDs
+
+I re-genotyped some samples with poor quality from the first sequencing run. Here, if an individual is multiply-genotyped, take the genotype with the highest total read depth. 
+```{r take-just-one}
+# slow-ish function to get the total read depth column
+tdepth <- function(a, d) {
+  if(any(is.na(a))) {
+    return(NA)
+  }
+  if(a[1]==a[2]) {
+    return(d[1])
+  } else {
+    return(d[1] + d[2])
+  }
+  
+}
+# this takes the highest read-depth instance of each duplicately-genotyped individual.
+geno_one_each <- kgenos %>%
+  group_by(NMFS_DNA_ID, locus, gtseq_run, id) %>%
+  mutate(total_depth = tdepth(allele, depth)) %>%
+  ungroup() %>%
+  arrange(NMFS_DNA_ID, locus, desc(total_depth), gtseq_run, id, depth) %>%
+  group_by(NMFS_DNA_ID, locus) %>%
+  mutate(rank = 1:n()) %>%
+  ungroup() %>%
+  filter(rank <= 2)
+
+# geno_one_each %>%
+#   select(NMFS_DNA_ID) %>%
+#   unique()
+```
+
+
+Before tossing individuals with too much missing data, we want to implement our total read depth threshold.
+```{r total-depth}
+# out of curiosity, how many samples would be affected by the read depth filter at this point?
+how_many <- geno_one_each %>%
+  filter(total_depth < 20) %>% # only loci for which total read depth < 20
+  group_by(NMFS_DNA_ID) %>%
+  dplyr::select(NMFS_DNA_ID) %>%
+  count() %>%
+  mutate(n = n/2) %>% # to get to per-locus, rather than per-allele
+  #arrange(desc(n)) %>%
+  filter(n > 28)
+
+how_many
+```
+There are 17 birds that will have missing data at > 28 loci because of the total depth threshold of 20 reads.
+
+
+```{r filter-low-depth}
+# if total depth >= 20, print the allele; if not, print NA
+geno_one_each2 <- geno_one_each %>%
+   mutate(allele = ifelse(total_depth >=20, allele, NA))
+
+```
+
+
+### Toss out indivs with more than 28 missing loci (20%)
+Now, toss out any individual with more than 28 missing loci
+```{r toss-missers}
+no_hi_missers <- geno_one_each2 %>% 
+  group_by(NMFS_DNA_ID) %>%
+  filter(sum(!is.na(allele)) >= (113*2))
+
+# How many is that?
+kept <- no_hi_missers %>%
+  dplyr::select(NMFS_DNA_ID) %>%
+  unique()
+
+# save that to look at duplicated samples and other things in 03-CKMR-power-analysis.Rmd
+no_hi_missers %>%
+  write_csv("csv_outputs/no_hi_missers.csv")
+
+```
+
+## Making a GSI (Rubias) data set
+
+For the baselines, we want to treat the colony locations as populations.
+```{r make-group-ints}
+# rather than species, we want to hone in on the location information. 
+# Let's organize that a bit.
+meta_select <- meta %>%
+  dplyr::select(NMFS_DNA_ID, BOX_ID, BOX_POSITION, SAMPLE_ID, BATCH_ID, PROJECT_NAME, GENUS, SPECIES, REPORTED_LIFE_STAGE, COLLECTION_DATE, `Marine::LOCATION_COMMENTS_M`)
+
+# rename the location column
+colnames(meta_select)[11] <- "LOCATION"
+
+meta_select <- meta_select %>%
+  mutate(LOCATION = ifelse(LOCATION == "St. George", "StGeorge", LOCATION)) %>%
+  mutate(LOCATION = ifelse(LOCATION == "St. Paul", "StPaul", LOCATION)) %>%
+  mutate(LOCATION = ifelse(LOCATION == "St. Matthew", "StMatthew", LOCATION)) 
+
+meta_keep <- meta_select %>%
+  group_by(LOCATION) 
+
+```
+
+## Assignment to main colonies
+
+```{r mutate-meta}
+# modify the meta data colony identifiers to be consistent for the four major colonies
+meta_keep <- meta_keep %>%
+  mutate(COLONY = ifelse(LOCATION == "StGeorge", "Pribilof",
+                         ifelse(LOCATION == "StPaul", "Pribilof",
+                                ifelse(LOCATION == "Chowiet", "Semidi",
+                                       ifelse(LOCATION == "Kateekuk", "Semidi", LOCATION)
+                                       )
+                         )))
+```
+
+
+Let's pick them all out:
+```{r pick-out}
+nofu_ids <- meta_keep %>%
+  ungroup() %>%
+  mutate(group = COLONY) %>%
+  dplyr::select(NMFS_DNA_ID, group) %>%
+  arrange(group)
+
+```
+
+
+## Allele frequencies
+With those we can just filter down the genos to the ones that we want, and then we
+can get it into the format required for CKMR.
+```{r kelp-genos}
+# we will use this some more
+kg2 <- no_hi_missers %>% 
+  select(NMFS_DNA_ID, locus, allele) %>%
+  mutate(Chrom = "GTseq") %>% 
+  mutate(Pos = as.integer(factor(locus, levels = unique(locus)))) %>%
+  rename(Locus = locus,
+         Allele = allele) %>%
+  select(NMFS_DNA_ID, Chrom, Locus, Pos, Allele) %>%
+  ungroup()
+
+# get the allele freqs
+kg_ckmr_markers <- kg2 %>%
+  filter(!is.na(Allele)) %>% # it is vital to filter out the NAs at this stage
+  group_by(Chrom, Locus, Pos, Allele) %>%
+  summarise(counts = n()) %>%
+  group_by(Locus, Pos) %>%
+  mutate(Freq = counts / sum(counts)) %>%
+  select(-counts) %>%
+  mutate(AlleIdx = 1,
+         LocIdx = 1) %>%
+  reindex_markers(.)
+```
+
+
+## Making genotype matrices & checking for duplicated samples
+
+```{r}
+nofu_haps <- no_hi_missers %>%
+  filter(!is.na(allele)) %>%  # once again, it is critical to remove these at this point
+  select(NMFS_DNA_ID, locus, gene_copy, allele) %>%
+  rename(Locus = locus, Allele = allele)
+
+nofu_idx_frame <- kg_ckmr_markers %>%
+  select(Locus, Allele, LocIdx, AlleIdx) %>%
+  group_by(Locus) %>%
+  mutate(NumA = n()) %>%  # get the number of alleles at each locus
+  ungroup() %>%
+  left_join(nofu_haps, .)  %>%  # join the alle_idx's onto the actual genotype data
+  select(NMFS_DNA_ID, Locus, gene_copy, LocIdx, NumA, AlleIdx) %>%
+  spread(key = gene_copy, value = AlleIdx) %>%
+  mutate(GenoIdx = index_ab(a = `1`, b = `2`, A = NumA))
+
+# make a matrix of genotype integers 
+wide_nofu <- nofu_idx_frame %>%
+  select(NMFS_DNA_ID, LocIdx, GenoIdx) %>%
+  spread(data = ., key = LocIdx, value = GenoIdx)
+```
+
+Don't forget to set NA's to 0, and then decrease each value by 1:
+```{r make-mat}
+nofu_mat <- as.matrix(wide_nofu[, -1])
+rownames(nofu_mat) <- wide_nofu$NMFS_DNA_ID
+nofu_mat[is.na(nofu_mat)] <- 0
+nofu_mat <- nofu_mat - 1
+storage.mode(nofu_mat) <-  "integer"
+```
+
+## Looking for duplicated samples
+
+Looking back at Andy Ramey's USGS meta data, there are some duplicate samples? Or at least birds that may have been sampled multiple times. 
+
+We can quickly look through rocky_mat for pairs of indivs with lots of matching genotypes.
+```{r check-for-dupes}
+matchers <- pairwise_geno_id(S = nofu_mat, max_miss = 12) %>%
+  arrange(num_mismatch) %>%
+  mutate(NMFS_DNA_ID_1 = rownames(nofu_mat)[ind1],
+         NMFS_DNA_ID_2 = rownames(nofu_mat)[ind2])
+
+matchers %>%
+  arrange(desc(num_loc)) # need to use the filtered genotype data for this...
+```
+There are 13 samples that match perfectly. I should get rid of one of each pair.
+
+Now, to deal with these duplicates, here is what I will do: since all of the matchers have 0 mismatched loci, we are going to take just one from each pairs. 
+```{r toss-matchers}
+def_same <- matchers %>%
+  filter(num_mismatch <= 3)
+
+toss_these <- c(intersect(def_same$ind1, def_same$ind2), def_same$ind2) %>%
+  unique()
+
+nofu_mat_tossed <- nofu_mat[-toss_these,]
+```
+
+
+```{r}
+no_hi_missers_clean <- no_hi_missers %>%
+  filter(NMFS_DNA_ID %in% rownames(nofu_mat_tossed))
+
+# save that for the bycatch assignments
+write_csv(no_hi_missers_clean, "csv_outputs/baseline_no_hi_missers_clean.csv")
+```
+
+
+
