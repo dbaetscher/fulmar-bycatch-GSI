@@ -21,6 +21,8 @@ library(marmap)
 
 ```
 
+#### 06 August 2020 NOTE: the input file linking bycatch samples to geographic locations is confidential until publication
+
 ```{r load-new-data}
 # assignments
 nofu_w_meta <- read_csv("bycatch_data/FINAL_nofu_bycatch_downsampled_revised_06122020_newseasons.csv") 
