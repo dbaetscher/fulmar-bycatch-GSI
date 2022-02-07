@@ -32,7 +32,7 @@ nofu_ids <- read_csv("data/nofu_ids_04022019.csv")
 ## Allele frequencies
 With those we can just filter down the genos to the ones that we want, and then we
 can get it into the format required for CKMR.
-```{r kelp-genos}
+```{r genos}
 # we will use this some more
 kg2 <- no_hi_missers_clean %>% 
   select(NMFS_DNA_ID, locus, allele) %>%
@@ -243,13 +243,51 @@ overall - 76.7% accurately assigned
 at the 90% threshold - 91.4% samples correctly assigned
 
 
+Take a look at z-score outliers:
+```{r}
+sa_to_repu2 %>%
+  ggplot(aes(x = z_score)) +
+  geom_density() +
+  facet_wrap(.~collection)
+
+```
+
+
+Generate the full assignment matrix (without the ascertainment samples)
+and remove outliers based on z-scores
+```{r}
+# no assignment threshold
+sa_to_repu2 %>%
+  select(-missing_loci) %>%
+  #filter(z_score < 3 & z_score > -3) %>% # comment or uncomment to remove outliers
+  group_by(collection, inferred_collection) %>%
+  tally() %>%
+  pivot_wider(names_from = inferred_collection, values_from = n) %>%
+  write_csv("csv_outputs/colony_assignment_nothreshold.csv")
+  
+# 90% assignment
+sa_to_repu2 %>%
+  select(-missing_loci) %>%
+  filter(scaled_likelihood > 0.9) %>% # 90% threshold
+  #filter(z_score < 3 & z_score > -3) %>% # remove outliers
+  group_by(collection, inferred_collection) %>%
+  tally() %>%
+  pivot_wider(names_from = inferred_collection, values_from = n) %>%
+  write_csv("csv_outputs/colony_assignment_90perc_threshold.csv")
+
+```
+
+**I opted not to remove samples with z-scores > 3 and < -3 because these samples were collected on the breeding colonies and were not removed prior to GSI. Furthermore, the presence of more of these outliers for the Chagulak population could mean either a) there are birds from unsampled colonies that were collected on Chagulak, or b) with smaller sample sizes, the likelihood of sampling an incomplete distribution increases, and thus, more outliers occur.
+
+
 
 ## What about equalizing the number of samples?
 
 Go back to the rubias input
 
 ```{r}
-#set.seed(765)
+set.seed(765) # need to set a seed to make this reproducible!
+
 rubias_genos_36 <- rubias_genos2 %>%
   group_by(collection) %>%
   sample_n(36, replace = FALSE) %>% 
@@ -316,7 +354,7 @@ assign36_no_thres %>%
 
 # summary of assignments without a likelihood threshold
 top_assign36 %>%
-  filter(scaled_likelihood > 0.9) %>%
+  #filter(scaled_likelihood > 0.9) %>%
   group_by(repunit, inferred_repunit) %>%
   tally() %>%
   ungroup() %>%
@@ -324,9 +362,180 @@ top_assign36 %>%
   mutate(total = sum(n)) %>%
   mutate(correct = ifelse(repunit == inferred_repunit, n/total, 0)) %>%
   ungroup() %>%
-  filter(repunit == inferred_repunit) 
+  filter(repunit == inferred_repunit) #%>%
+  # ungroup() %>%
+  # summarise(mean(correct)) # calculate overall % accuracy
 ```
 
 Basically, the question is whether the assignment accuracy improves for Chagulak and St. Matthew when the subsample of 36 samples is used for self-assignment.
 
 And the answer is that at the 90% likelihood threshold, the full data set rather than the downsampled data set actually performs (slightly) better, and considerably better for the Pribs and Semidis.
+
+
+
+## Sampling time frames
+
+Thinking more about the z-scores and the long temporal range encompassed by the colony samples, I wonder if there are temporal patterns of assignment that pop out.
+```{r}
+meta %>%
+  filter(str_detect(COLLECTION_DATE, "93"))
+
+```
+30 samples from Chagulak from 1992
+66 samples from the Semidis (Chowiet) from 1993
+
+Both are potentially interesting cases.
+
+```{r}
+meta %>%
+  filter(`Marine::LOCATION_COMMENTS_M` %in% c("Chowiet")) %>%
+  group_by(COLLECTION_DATE) %>%
+  tally()
+```
+
+286 samples collected over 10 dates.
+The one listed as 2017 is certainly an error in the formatting of the Excel file...
+
+But let's just look at the difference between the 2004 and 1993 samples. That's an 11-year interval.
+
+```{r zscores-time-periods}
+sa_to_repu2 %>%
+  filter(collection == "Semidi") %>%
+  left_join(., meta, by = c("indiv" = "NMFS_DNA_ID")) %>%
+  filter(COLLECTION_DATE == "7/10/93" | str_detect(COLLECTION_DATE, "04")) %>% # samples from 1993 or 2004
+  mutate(period = ifelse(COLLECTION_DATE == "7/10/93", "1993", "2004")) %>%
+  ggplot(aes(x = z_score, color = period)) +
+  geom_density()
+
+```
+
+What if I do an assignment test with just those two time period groups?
+```{r time-assign}
+time_periods <- meta %>%
+  filter(COLLECTION_DATE == "7/10/93" | str_detect(COLLECTION_DATE, "04")) %>% # samples from 1993 or 2004
+  mutate(period = ifelse(COLLECTION_DATE == "7/10/93", "1993", "2004")) %>%
+  select(NMFS_DNA_ID, period)
+
+# select just those samples from the rubias-ready genotypes
+semidi_time_test <- rubias_genos2 %>%
+  filter(collection == "Semidi") %>%
+  inner_join(., time_periods, by = c("indiv" = "NMFS_DNA_ID")) %>%
+  mutate(collection = period) %>%
+  select(-period)
+
+# perform rubias self-assignment
+semidi_test <- self_assign(reference = semidi_time_test, gen_start_col = 5)
+
+# summarize repunit results
+top_semidi_assigned <- semidi_test %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments without a likelihood threshold
+top_semidi_assigned %>%
+  group_by(collection, inferred_collection) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(collection) %>%
+  mutate(prop = n/sum(n))
+
+```
+
+```{r}
+meta %>%
+  filter(COLLECTION_DATE == "7/10/93" | str_detect(COLLECTION_DATE, "04")) %>% # samples from 1993 or 2004
+  mutate(period = ifelse(COLLECTION_DATE == "7/10/93", "1993", "2004")) %>%
+  filter(`Marine::LOCATION_COMMENTS_M` %in% c("Chowiet", "Kateekuk")) %>%
+  anti_join(rubias_genos2, by = c("NMFS_DNA_ID" = "indiv")) # maybe a bunch of the 1993 samples dropped out?
+  
+
+
+```
+
+
+```{r plot-temporal-assign}
+# looks like there's not temporal structure - at least not in the markers we're using
+top_semidi_assigned %>%
+  ggplot(aes(x = collection, fill = inferred_collection)) +
+  geom_bar(stat = "count")
+
+```
+
+
+## Temporal stability analyses
+
+More questions about the genetic stability of the colonies over the 25 year sampling period
+
+```{r}
+library(lubridate)
+
+(meta$COLLECTION_DATE)
+
+meta %>%
+  select(NMFS_DNA_ID, COLLECTION_DATE) %>%
+  mutate(collection_year = year(meta$COLLECTION_DATE))
+
+# we're missing correct collection dates for 35 samples... I can come back to that
+m1 <- meta %>%
+  filter(str_detect(COLLECTION_DATE, "/")) 
+
+m1$year <- year(mdy(m1$COLLECTION_DATE)) # make a new variable - Year
+
+rubias_temporal_genos <- m1 %>%
+  select(NMFS_DNA_ID, year) %>%
+  inner_join(rubias_genos2, by = c("NMFS_DNA_ID"="indiv")) %>% # we're missing those samples without year info (35)
+  unite(col = "collection", collection, year, sep = "_", remove = T) %>%
+  select(sample_type, repunit, collection, NMFS_DNA_ID, 5:270) %>%
+  rename(indiv = NMFS_DNA_ID) %>%
+  mutate(repunit = collection)
+
+```
+
+
+```{r rubias-self-assign-temporal-grps}
+temporal_test <- self_assign(reference = rubias_temporal_genos, gen_start_col = 5)
+
+```
+
+```{r}
+# summarize repunit results
+top_temporal_assigned <- temporal_test %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments without a likelihood threshold
+top_temporal_assigned %>%
+  group_by(collection, inferred_collection) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(collection) %>%
+  mutate(prop = n/sum(n)) 
+
+# manually set the colors to be in families for the colonies
+colors <- c("gold1", "lightskyblue3", "lightskyblue", "dodgerblue", "darkorange", "darkorange1", "darkorange2", "orangered1", "orangered4", "darkmagenta", "blue1")
+
+top_temporal_assigned %>%
+  ggplot(aes(x = collection, fill = inferred_collection)) +
+  geom_bar(stat = "count") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9)
+  ) +
+  scale_fill_manual(values = colors)
+
+```
+
+Now just look at the >90% assignment threshold...
+```{r}
+top_temporal_assigned %>%
+  filter(scaled_likelihood >0.9) %>%
+  ggplot(aes(x = collection, fill = inferred_collection)) +
+  geom_bar(stat = "count") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9)
+  ) +
+  scale_fill_manual(values = colors)
+
+```
+

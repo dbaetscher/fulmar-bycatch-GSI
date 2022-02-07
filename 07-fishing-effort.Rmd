@@ -1,0 +1,452 @@
+---
+title: "fishing effort data"
+output: html_notebook
+---
+
+1 November 2021
+
+
+These are the data that Jordan Watson procured for us from AKFIN. We want to take a look at the data from the fishing effort and incorporate that into the fulmar bycatch distributions.
+
+The first goal would be to make a map that looks like the bycatch map, but shows the spatial distribution of fishing effort.
+
+
+```{r load-packages}
+library(tidyverse)
+library(dplyr)
+library(adehabitatHR)
+library(ggplot2)
+library(magrittr)
+library(sp)
+library(raster)
+library(marmap)
+library(mapdata)
+
+library(spData)
+```
+
+
+
+```{r load-data}
+fishing <- readRDS("extdata/longline_effort_halfdegree_bins_diana_w_hooks.RDS") %>%
+  mutate(season = ifelse(month %in% c(5:9), "breeding", "nonbreeding"))
+
+fish_by_hooks <- fishing %>%
+  group_by(season, lonr, latr) %>%
+  summarise(sum(hooks)) %>%
+  rename(tot_hooks = `sum(hooks)`)
+
+```
+```{r}
+ggplot(fish_by_hooks) +
+  geom_point(aes(x = lonr, y = latr))
+```
+
+
+Flip the sign on the data points with the wrong longitude.
+
+```{r}
+fish_effort <- fish_by_hooks %>%
+  mutate(lon = ifelse(lonr > 0, (360-lonr)*-1, lonr)) 
+
+fish_effort %>% # deal with the international date line
+  ggplot(aes(x = lon, y = latr)) +
+  geom_point()
+
+```
+
+Quick check: What is the max N latitude?
+```{r}
+fish_effort %>%
+  arrange(desc(latr)) # is this bec of the original data dump from Jordan?
+```
+
+Okay, I need to think about how to weight the number of hooks...
+
+First, maybe look at the distribution of hooks?
+```{r}
+fish_effort %>%
+  ggplot(aes(x = lon, y = latr, color = tot_hooks)) +
+  geom_point() +
+  facet_wrap(~season) +
+  theme_bw()
+
+```
+
+
+### spatial data projections
+
+```{r reproject-datapoints}
+### define projections
+# input_proj <- "+proj=longlat +datum=WGS84" ###the input projection of track points
+# desired_proj <- "+proj=aea +lat_1=55 +lat_2=65 +lat_0=50 +lon_0=-154 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m +no_defs" ###the desired projection for track points
+# 
+# ### convert data to a spatial object and reproject to desired coordinate system
+# coordinates(fishing_season2) = ~lonr+latr ### define the x and y spatial fields
+# proj4string(fishing_season2) <- CRS(input_proj) ### define the projection
+# fish_effort_tr <- spTransform(fishing_season2, CRS(desired_proj)) ###transform to desired projection
+# 
+# # another quick plot
+# plot(fish_effort_tr, pch = 19, cex = 0.5)
+```
+
+I have two forms of effort - 
+1. the number of vessels in a given geographic area (similar to the way the bycatch fulmars were treated)
+2. the number of hooks each vessel set
+
+I think what makes more sense is to use hooks integrated across space as our measure of effort. I'm going to need to tweak the code that I had used for the fulmar kerneling because in that case, each data point was one bird with one set of lat/lon, whereas for this, each spatial datapoint corresponds to many many hooks.
+
+Add bathymetric map
+```{r}
+# antimeridian region 
+aleu <- marmap::getNOAA.bathy(179, -135, 50, 67, resolution = 4,
+antimeridian = TRUE)
+
+# Make it a raster
+#bathy <- as.raster(aleu)
+
+# Create a xyz table for ggplot
+#bath<-fortify(aleu)
+
+```
+
+### bathymetry
+
+this mapping from: https://hansenjohnson.org/post/bathymetric-maps-in-r/
+```{r}
+library(oce)
+library(ocedata)
+data("coastlineWorldFine")
+
+# convert bathymetry
+# bathyLon = as.numeric(rownames(aleu))
+# bathyLat = as.numeric(colnames(aleu))
+# bathyZ = as.numeric(aleu)
+# dim(bathyZ) = dim(aleu)
+
+
+# define plotting region
+mlon = mean(fish_effort$lon)
+mlat = mean(fish_effort$latr)
+span = 2000
+```
+
+
+```{r plotting-density-of-observations-not-hooks}
+# fishing_season2 %>%
+#   ggplot(aes(x = lonr, y = latr)) +
+#   geom_point(size = 0.1) +
+#   stat_density2d(
+#     aes(fill = stat(level)),
+#     geom = "polygon",
+#     contour_var = "density",
+#     contour_type = "bands",
+#     alpha = 0.7,
+#   ) +
+#     scale_fill_gradient(low = "yellow", high = "red") + scale_alpha(range = c(0.00, 0.25), guide = FALSE)
+
+```
+
+
+```{r custom-bins}
+#qBins <- quantile(fish_by_hooks$tot_hooks)
+
+```
+
+```{r summarize-effot-stats}
+fish_effort %>%
+  group_by(season) %>%
+  summarise(sum(tot_hooks)) %>%
+  mutate(tot_hooks_across_seasons = sum(`sum(tot_hooks)`)) %>%
+  mutate(hooks_per_month = ifelse(season == "breeding", `sum(tot_hooks)`/5, `sum(tot_hooks)`/7)) 
+
+
+  # mutate(prop_effort = ifelse(season == "breeding", `sum(tot_hooks)`/tot_hooks_across_seasons, `sum(tot_hooks)`/tot_hooks_across_seasons))
+
+```
+
+
+```{r plotting-density-of-hooks-w-geom_tile}
+fish_effort %>%
+  ggplot(aes(x = lon, y = latr)) +
+  #geom_point(size = 0.1) +
+  geom_tile(
+    aes(x = lon, y = latr, fill = tot_hooks),
+    alpha = 0.5,
+  ) +
+    scale_fill_stepsn(colors = heat.colors(5, alpha = 0.5, rev = TRUE))+
+  theme_bw() +
+  xlab("Longitude") +
+  ylab("Latitude")
+
+```
+
+I don't want a density map. Basically, I have a numeric variable that I want to plot as the gradient fill on the map (rather than computing the density of observations).
+
+
+```{r}
+#plot(spdf)
+# I need to fortify the data
+library(broom)
+require(mapdata)
+
+aleu.fort <- marmap::fortify.bathy(aleu)
+
+# get regional polygons
+reg = map_data("world2Hires")
+region = subset(reg, region %in% c('USA', 'Canada'))
+
+# filter
+ak <- region %>%
+  filter(lat > 50 & lat < 65, long < 240)
+
+```
+
+
+```{r}
+# set map limits
+#lons = c(-180, -135)
+#lats = c(45, 65)
+
+# plot
+ggplot() +
+ # add 100m contour
+  geom_contour(data = aleu.fort, 
+               aes(x=x, y=y, z=z),
+               breaks=c(-100),
+               size=c(0.3),
+               colour="grey") +
+  
+  # add 250m contour
+  geom_contour(data = aleu.fort, 
+               aes(x=x, y=y, z=z),
+               breaks=c(-250),
+               size=c(0.6),
+               colour="grey") +
+  
+  # add coastline
+  geom_polygon(data = ak, aes(x = long, y = lat, group = group), 
+               fill = "darkgrey", color = NA) +
+  theme_bw()
+```
+
+
+```{r ak-coastline-map-w-fishing-effort}
+#formatting
+breaks <- c(5000, 10000, 50000, 100000, 500000, 1000000, 5000000)
+custom_bins <- quantile(fish_effort$tot_hooks, probs=c(0,.2,.4,.6,.8,1))
+
+
+fish_by_hooks_df <- mutate(fish_effort, hooks=cut(tot_hooks, breaks=custom_bins))
+fish_by_hooks_df1 <- fish_by_hooks_df %>%
+  filter(!is.na(hooks))
+
+```
+
+
+```{r map-params}
+# get regional polygons
+reg = map_data("world2Hires")
+regions = subset(reg, region %in% c('USA', 'Canada')) %>%
+  filter(lat > 47 & lat < 65, long < 240)
+
+# convert lat longs
+regions$long = (360 - regions$long)*-1
+
+# set map limits
+lons = c(-188, -140) #this needs to extend beyond the date line
+lats = c(50, 61.75)
+
+```
+
+
+
+```{r ak-map-w-fishing-effort}
+library(ggplot2)
+# make plot
+ggplot()+
+  
+  # add 100m contour
+  geom_contour(data = aleu.fort, 
+               aes(x=x, y=y, z=z),
+               breaks=c(-100),
+               size=c(0.3),
+               colour="grey") +
+  
+  # add 250m contour
+  geom_contour(data = aleu.fort, 
+               aes(x=x, y=y, z=z),
+               breaks=c(-250),
+               size=c(0.6),
+               colour="grey") +
+  
+  # add coastline
+  geom_polygon(data = regions, aes(x = long, y = lat, group = group), 
+               fill = "darkgrey", color = NA) + 
+  
+  # add hooks (fishing effort)
+  geom_tile(data = fish_by_hooks_df1,
+    aes(x = lon, y = latr, fill = hooks),
+    alpha = 0.75,
+  ) +
+    #scale_fill_gradient(low = "yellow", high = "red")+
+  #scale_fill_stepsn(colors = RColorBrewer::brewer.pal(5, "YlOrRd"), breaks = custom_bins) +
+  scale_fill_brewer(palette = "YlOrRd") +
+   # facet seasons
+  facet_grid(rows = vars(season)) +
+  
+  # configure projection and plot domain
+  coord_map(xlim = lons, ylim = lats)+
+
+  
+  # formatting
+  xlab("Longitude") +
+  ylab("Latitude") +
+  labs(fill = "# of hooks (quantiles)") +
+  theme_bw()+ 
+  theme(
+    axis.title.x = element_text(margin = margin(t=10)),
+    axis.title.y = element_text(margin = margin(r=10))
+  )
+ # manually set the text for the legend. 
+ 
+#ggsave("pdf_outputs/fishing_effort_map_season.pdf", width = 7, height = 9)
+```
+
+
+Make the same maps, but zoom in so the spatial extent matches the utilization distribution maps for the colonies:
+```{r zoomed-map}
+# set map limits
+lons = c(-181, -155) #this needs to extend beyond the date line
+lats = c(51, 61.1)
+
+# make plot
+ggplot()+
+  
+  # add coastline
+  geom_polygon(data = regions, aes(x = long, y = lat, group = group), 
+               fill = "darkgrey", color = NA) + 
+  
+  # add hooks (fishing effort)
+  geom_tile(data = fish_by_hooks_df1,
+    aes(x = lon, y = latr, fill = hooks),
+    alpha = 0.75,
+  ) +
+    #scale_fill_gradient(low = "yellow", high = "red")+
+  #scale_fill_stepsn(colors = RColorBrewer::brewer.pal(5, "YlOrRd"), breaks = custom_bins) +
+  scale_fill_brewer(palette = "YlOrRd") +
+   # facet seasons
+  facet_grid(rows = vars(season)) +
+  
+  # configure projection and plot domain
+  coord_map(xlim = lons, ylim = lats)+
+
+  
+  # formatting
+  xlab("Longitude") +
+  ylab("Latitude") +
+  labs(fill = "# of hooks (quantiles)") +
+  theme_bw()+ 
+  theme(
+    axis.title.x = element_text(margin = margin(t=10)),
+    axis.title.y = element_text(margin = margin(r=10))
+  )
+  
+ggsave("pdf_outputs/fishing_effort_map_season_zoomed.pdf", width = 7, height = 9)
+
+```
+
+
+```{r}
+# make plot
+test.map <- ggplot()+
+  
+  # add 100m contour
+  geom_contour(data = aleu.fort,
+               aes(x=x, y=y, z=z),
+               breaks=c(-100),
+               size=c(0.3),
+               colour="grey") +
+
+  # add 250m contour
+  geom_contour(data = aleu.fort,
+               aes(x=x, y=y, z=z),
+               breaks=c(-250),
+               size=c(0.6),
+               colour="grey") +
+
+  # add coastline
+  geom_polygon(data = regions, aes(x = long, y = lat, group = group), 
+               fill = "darkgrey", color = NA) + 
+  
+ 
+  # configure projection and plot domain
+  coord_map(xlim = lons, ylim = lats)+
+  
+  # formatting
+  xlab("Longitude") +
+  ylab("Latitude") +
+  labs(fill = "# of hooks (quantiles)") +
+  theme_bw()+ 
+  theme(
+    axis.title.x = element_text(margin = margin(t=10)),
+    axis.title.y = element_text(margin = margin(r=10))
+  )
+
+```
+
+
+Can I zoom in more on that?
+```{r}
+region.zoom <- regions %>%
+  filter(long < -145, long > -181, lat > 50, lat < 62)
+```
+
+```{r}
+albers.ak.map <- ggplot() +
+  geom_polygon(data = region.zoom, aes(x = long, y = lat, group = group), 
+               fill = "darkgrey", color = NA) +
+  coord_map(projection = "albers", par=55,62) +
+  theme_minimal()
+
+albers.ak.map 
+
+ggsave("pdf_outputs/albers_map_ak.pdf")
+```
+
+
+
+```{r}
+# zoom in on the effort data too
+fish_by_hooks_to_plot <- fish_by_hooks_df1 %>%
+  filter(lon < -145, lon > -181, latr > 50, latr < 62)
+
+albers.ak.map +
+# add hooks (fishing effort)
+  geom_tile(data = fish_by_hooks_df1,
+    aes(x = lon, y = latr, fill = hooks),
+    alpha = 0.75,
+  ) +
+  ylim(c(51,61.5)) +
+  xlim(c(-181,-150)) +
+    #scale_fill_gradient(low = "yellow", high = "red")+
+  #scale_fill_stepsn(colors = RColorBrewer::brewer.pal(5, "YlOrRd"), breaks = custom_bins) +
+  scale_fill_brewer(palette = "YlOrRd") +
+   # facet seasons
+  facet_grid(rows = vars(season)) +
+
+  # formatting
+  xlab("Longitude") +
+  ylab("Latitude") +
+  labs(fill = "# of hooks (quantiles)") +
+  theme_bw()+ 
+  theme(
+    axis.title.x = element_text(margin = margin(t=10)),
+    axis.title.y = element_text(margin = margin(r=10))
+  )
+
+ggsave("pdf_outputs/hooks_effot_aea_proj.pdf", width = 7, height = 9)
+```
+
+
+

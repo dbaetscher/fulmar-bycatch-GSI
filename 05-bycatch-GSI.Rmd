@@ -180,3 +180,254 @@ downsampled_bycatch_dataset %>%
 
 ```
 
+
+## Temporal stability
+
+
+Take the samples that were assigned to colonies at >90%. 
+
+```{r}
+downsampled_bycatch_dataset
+
+baseline_ids
+
+baseline
+```
+
+The cumulative NMFS ids that we want to use in this self-assignment:
+```{r}
+# make one big df for self-assignment
+combined_df <- bind_rows(baseline, no_hi_missers)
+
+# allele frequencies
+kg2 <- combined_df %>% 
+  select(NMFS_DNA_ID, locus, allele) %>%
+  mutate(Chrom = "GTseq") %>% 
+  mutate(Pos = as.integer(factor(locus, levels = unique(locus)))) %>%
+  rename(Locus = locus,
+         Allele = allele) %>%
+  select(NMFS_DNA_ID, Chrom, Locus, Pos, Allele) %>%
+  ungroup()
+
+# get the allele freqs
+kg_ckmr_markers <- kg2 %>%
+  filter(!is.na(Allele)) %>% # it is vital to filter out the NAs at this stage
+  group_by(Chrom, Locus, Pos, Allele) %>%
+  summarise(counts = n()) %>%
+  group_by(Locus, Pos) %>%
+  mutate(Freq = counts / sum(counts)) %>%
+  select(-counts) %>%
+  mutate(AlleIdx = 1,
+         LocIdx = 1) %>%
+  reindex_markers(.)
+
+# summary stats
+kg_ckmr_markers %>%
+  group_by(Locus) %>%
+  tally() %>%
+  arrange(n) %>%
+  summarise(mean(n))
+
+```
+
+Remove the 8 loci that are out of HWE in three or more of the four populations. 
+```{r}
+# loci that deviate
+outliers <- read_csv("csv_outputs/loci_out_hwe.csv")
+
+outliers$Locus <- gsub("_1", "", outliers$Locus)
+```
+
+```{r}
+# replace the weird characters in the locus name to match
+combined_df$locus <- gsub(":", "_", combined_df$locus)
+combined_df$locus <- gsub("-", "_", combined_df$locus)
+```
+
+```{r}
+# now anti-join the loci to remove and the no_hi_misser genotypes
+combined_df_loc <- combined_df %>% 
+  anti_join(., outliers, by = c("locus" = "Locus"))
+
+```
+
+Check the number of samples
+```{r}
+combined_df_loc %>% 
+  select(NMFS_DNA_ID) %>%
+  unique()
+
+```
+
+
+## Self-assignment format
+
+```{r spread-genos}
+# first make integers of the alleles
+alle_idxs <- combined_df_loc %>% 
+  dplyr::select(NMFS_DNA_ID, locus, gene_copy, allele) %>%
+  group_by(locus) %>%
+  mutate(alleidx = as.integer(factor(allele, levels = unique(allele)))) %>%
+  ungroup() %>%
+  arrange(NMFS_DNA_ID, locus, alleidx) 
+# select just the columns to retain and spread the alleles
+alle_idx2 <- alle_idxs[,-4]
+  
+two_col <- alle_idx2 %>%
+  unite(loc, locus, gene_copy, sep = ".") %>%
+  spread(loc, alleidx)
+```
+
+### get it into the right format for rubias
+
+```{r ids-grps}
+# nofu ids for samples without duplicates, etc.
+nofu_ids <- read_csv("data/nofu_ids_04022019.csv") %>%
+  rename(collection = group)
+
+
+combo_ids <- downsampled_bycatch_dataset %>%
+  select(NMFS_DNA_ID, collection) %>%
+  bind_rows(nofu_ids) %>%
+  mutate(sample_type = "reference")
+
+
+```
+
+
+```{r add-meta}
+two_col2 <- two_col %>%
+  left_join(combo_ids) # add group identity
+
+# reorder the columns
+two_col3 <- two_col2[,c(268:269,1:267)]
+
+# make the reference file
+rubias_genos <- two_col3 %>%
+  mutate(repunit = collection)
+
+# reorder the columns
+rubias_genos1 <- rubias_genos[,c(2,270,1,3:269)]
+
+# rename indiv column
+rubias_genos2 <- rubias_genos1 %>%
+  rename(indiv = NMFS_DNA_ID) %>%
+  filter(!is.na(collection))
+
+
+```
+
+
+```{r self-assign}
+# Now that the data are in the correct format,
+# perform self-assignment on baseline colony samples
+sa_fulmars <- self_assign(reference = rubias_genos2, gen_start_col = 5)
+
+# summarize repunit results
+sa_to_repu <- sa_fulmars %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments 
+assign_no_thres <- sa_to_repu %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally()
+
+```
+
+
+1. double check collecion x date
+Add collection date info
+```{r}
+rubias_genos2
+```
+
+```{r}
+library(lubridate)
+```
+
+```{r}
+# meta data
+baseline_meta <- readRDS("data/meta-data-tibble.rds")
+
+m1 <- baseline_meta %>%
+  filter(str_detect(COLLECTION_DATE, "/")) 
+
+m1$year <- year(mdy(m1$COLLECTION_DATE)) # make a new variable - Year
+
+baseline_years <- m1 %>%
+  select(NMFS_DNA_ID, year)
+```
+
+
+
+```{r}
+# the date is in the "TAG_NUMBER" field
+mix_meta <- meta %>%
+  select(NMFS_DNA_ID, TAG_NUMBER) %>%
+  filter(str_detect(TAG_NUMBER, "AK")) %>%
+  separate(TAG_NUMBER, into = c("state", "year", "month", "day", "mon2", "day2"), sep = "-") %>%
+  select(NMFS_DNA_ID, year)
+
+m2 <- meta %>%
+  select(NMFS_DNA_ID, TAG_NUMBER) %>%
+  filter(!str_detect(TAG_NUMBER, "AK")) %>%
+  separate(TAG_NUMBER, into = c("year", "month", "day", "mon2", "day2"), sep = "-") %>%
+  select(NMFS_DNA_ID, year) %>%
+  filter(!str_detect(year, "Alaska"))
+
+# combine those dfs
+years <- bind_rows(mix_meta, m2)
+
+years$year <- as.numeric(years$year)
+
+all_years <- years %>%
+  bind_rows(baseline_years) %>%
+  filter(!is.na(year)) %>%
+  unique()
+
+# this doesn't include the metadata for the baseline samples
+rubias_temporal_genos <- rubias_genos2 %>%
+  inner_join(all_years, by = c("indiv"="NMFS_DNA_ID")) %>% 
+  unite(col = "collection", collection, year, sep = "_", remove = T) %>%
+  #select(sample_type, repunit, collection, NMFS_DNA_ID, 5:270) %>%
+  #rename(indiv = NMFS_DNA_ID) %>%
+  mutate(repunit = collection)
+
+rubias_temporal_genos %>%
+  group_by(indiv) %>%
+  add_tally() %>%
+  filter(n > 1)
+```
+
+```{r rubias-temporal-analysis}
+# perform self-assignment on baseline and bycatch samples
+sa_fulmar_years <- self_assign(reference = rubias_temporal_genos, gen_start_col = 5)
+
+# summarize repunit results
+sa_to_repu_years <- sa_fulmar_years %>%
+  group_by(indiv, collection, repunit) %>%
+  top_n(1, scaled_likelihood) # just the top assignment for each sample
+  
+# summary of assignments
+sa_to_repu_years %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  tally()
+
+```
+
+```{r}
+sa_to_repu_years %>%
+  filter(scaled_likelihood > 0.9) %>%
+  group_by(repunit, inferred_repunit) %>%
+  ggplot(aes(x = collection, fill = inferred_collection)) +
+  geom_bar(stat = "count") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.9)
+  ) #+
+  #scale_fill_manual(values = colors)
+```
+

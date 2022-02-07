@@ -1,0 +1,152 @@
+---
+title: "fishing effort vs. bycatch - CPUE index"
+output: html_notebook
+---
+
+17 January 2022
+
+This is the logical riff off of what Jon helped me with to perform some raster math on the bycatch and fishing effort data.
+
+This code generates the CPUE index map in SI Figure S2.
+
+```{r load-packages}
+library(raster)
+library(ggplot2)
+library(dplyr)
+library(sp)
+library(lubridate)
+library(RColorBrewer)
+library(mapdata)
+```
+
+
+```{r load-fishing-effort-data}
+fishing <- readRDS("extdata/longline_effort_halfdegree_bins_diana_w_hooks.RDS") %>%
+  mutate(season = ifelse(month %in% c(5:9), "breeding", "nonbreeding"))
+
+fish_by_hooks <- fishing %>%
+  group_by(season, lonr, latr) %>%
+  summarise(sum(hooks)) %>%
+  rename(tot_hooks = `sum(hooks)`)
+
+```
+
+```{r effort-raster}
+### read in the effort raster I made
+fishing_effort<-raster("extdata/effort.tif")
+```
+
+
+```{r load-bycatch-data}
+### read in bycatches
+fulmars <- read.csv("bycatch_data/FINAL_nofu_bycatch_downsampled_revised_06122020_newseasons.csv") %>%
+  mutate(bycatches=1) %>% #need this for summing points per grid cell later
+  filter(!is.na(FisheriesLatDD), !is.na(FisheriesLongDD)) #get rid of NA lat/longs
+
+```
+
+
+```{r project-fishing-effort}
+coordinates(fish_by_hooks) <- ~lonr+latr
+proj4string(fish_by_hooks) <- CRS("+proj=longlat +datum=WGS84")
+fish_by_hooks_projected <- spTransform(fish_by_hooks, CRS("+proj=aea +lat_1=55 +lat_2=65 +lat_0=50 +lon_0=-154 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"))
+
+```
+
+```{r}
+### alternative raster
+rast <- raster(resolution=1, ext=extent(fish_by_hooks), crs=proj4string(fish_by_hooks)) #create
+fishing_effort2 <- rasterize(fish_by_hooks, rast, 'tot_hooks', fun=sum)
+
+# note: this is not in the aea projection.
+```
+
+
+```{r}
+### make bycatch spatial points, rasterize to match effort raster and sum catches per grid cell
+coordinates(fulmars) <- ~FisheriesLongDD+FisheriesLatDD
+proj4string(fulmars) <- CRS("+proj=longlat +datum=WGS84")
+fulmars_projected <- spTransform(fulmars, CRS("+proj=aea +lat_1=55 +lat_2=65 +lat_0=50 +lon_0=-154 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"))
+
+fulmar_catches <- rasterize(fulmars, fishing_effort, 'bycatches', fun=sum, background=0) #use background=0 to make sure you get zeros (instead of NAs) later on when you do raster math since you want the answer "0" not "NA" when there was no bycatch but there was fishing effort
+fulmar_catches2 <- fulmar_catches #this one is just for plotting not for math
+fulmar_catches2[fulmar_catches2 == 0] <- NA #convert zeroes to NAs just for plotting not for math
+```
+
+
+```{r fulmar-cpue}
+# Multiply out the number of bycatches to expand from 2% (for which we have samples) to 100%
+fulmar_CPUE <- 1000000*((100*fulmar_catches)/2)/fishing_effort #calculate bycatch per unit effort per million hooks
+
+# convert raster to data frame
+test_spdf <- rasterToPoints(fulmar_CPUE)
+test_df <- as.data.frame(test_spdf)
+colnames(test_df) <- c("x", "y", "value")
+
+# fix the longitude values
+cpue.df <- test_df %>%
+  mutate(lon = ifelse(x > 0, (360-x)*-1, x)) %>%
+  mutate(lat = y)
+
+```
+
+```{r}
+# set limits
+xmax = max(cpue.df$lon)
+xmin = min(cpue.df$lon)
+ymax = max(cpue.df$lat)
+ymin = min(cpue.df$lat)
+
+ylim = c(ymin, ymax)
+xlim = c(xmin, xmax)
+```
+
+
+
+```{r get-coastline-polygon}
+# get regional polygons
+reg = map_data("world2Hires")
+regions = subset(reg, region %in% c('USA', 'Canada')) %>%
+  filter(lat > 47 & lat < 65, long < 240)
+
+# convert lat longs
+regions$long = (360 - regions$long)*-1
+
+# set map limits
+#lons = c(-188, -140) #this needs to extend beyond the date line
+#lats = c(50, 61.75)
+
+region.zoom <- regions %>%
+  filter(long < -145, long > -181, lat > 50, lat < 62)
+```
+
+
+```{r plot-cpue-index}
+# make plot of bycatch per fishing effort 
+ggplot() +  
+  geom_polygon(data = region.zoom, aes(x = long, y = lat, group = group), 
+               fill = "grey38", color = NA) +
+  geom_tile(data=cpue.df, aes(x=lon, y=lat, fill=log(value)), alpha=0.7) + 
+  #geom_polygon(data=OR, aes(x=long, y=lat, group=group), 
+               #fill=NA, color="grey50", size=0.25) +
+  xlim(xlim) +
+  ylim(ylim) +
+  coord_map(projection = "albers", par=55,62) +
+  theme_minimal() +
+  scale_fill_gradientn(colors = c("lemonchiffon", "gold","orange", "firebrick")) +
+  labs(
+    y = "Latitude",
+    x = "Longitude",
+    fill = "CPUE index"
+  ) +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10))
+  )
+
+# Make SI Figure 2 with CPUE index
+# mismatch between fishing effort and bycatch % makes the numeric scale meaningless, but the relative amounts correct
+ggsave("pdf_outputs/nofu_bycatch_cpue_scaled.pdf")
+```
+
+
