@@ -3,6 +3,11 @@ Genetic Stock Identification of Northern Fulmar bycatch from N Pacific groundfis
 
 Analyses to accompany the paper.
 
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.5998907.svg)](https://doi.org/10.5281/zenodo.5998907)
+
+
+
 ## Data 
 
 1. Colony samples (for RAD-seq, microhaplotype discovery, and self-assignment)
